@@ -7,7 +7,7 @@ from typing import Optional, List, Tuple, Dict, Any
 import logging
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.schemas.app_client import (
     AppClientCreate, AppClientUpdate, AppClientResponse, AppClientWithSecret,
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class KeyService:
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: Session):
         self.session = session
 
     # ---------- mapping helpers ----------
@@ -57,7 +57,7 @@ class KeyService:
 
     # ================== App Clients ==================
 
-    async def create_app_client(self, org_id: str, data: AppClientCreate) -> AppClientWithSecret:
+    def create_app_client(self, org_id: str, data: AppClientCreate) -> AppClientWithSecret:
         """
         Create a new app client with OAuth credentials.
         Returns client with secret (shown only once).
@@ -74,13 +74,13 @@ class KeyService:
 
         self.session.add(c)
         try:
-            await self.session.commit()
+            self.session.commit()
         except IntegrityError:
-            await self.session.rollback()
+            self.session.rollback()
             # likely unique(org_id, name) or unique(client_id)
             raise ValueError("App client name already exists in this organization")
 
-        await self.session.refresh(c)
+        self.session.refresh(c)
 
         return AppClientWithSecret(
             id=str(c.id),
@@ -94,18 +94,18 @@ class KeyService:
             updated_at=c.updated_at,
         )
 
-    async def get_app_client(self, client_id: str) -> Optional[AppClientResponse]:
+    def get_app_client(self, client_id: str) -> Optional[AppClientResponse]:
         """Get app client by internal ID (not OAuth client_id)."""
-        res = await self.session.execute(select(AppClient).where(AppClient.id == client_id))
+        res = self.session.execute(select(AppClient).where(AppClient.id == client_id))
         c = res.scalar_one_or_none()
         return self._client_to_response(c) if c else None
 
-    async def get_app_client_by_oauth_id(self, oauth_client_id: str) -> Optional[dict]:
+    def get_app_client_by_oauth_id(self, oauth_client_id: str) -> Optional[dict]:
         """
         Get app client by OAuth client_id (for authentication).
         NOTE: returns dict-like info needed for auth; includes secret hash.
         """
-        res = await self.session.execute(select(AppClient).where(AppClient.client_id == oauth_client_id))
+        res = self.session.execute(select(AppClient).where(AppClient.client_id == oauth_client_id))
         c = res.scalar_one_or_none()
         if not c:
             return None
@@ -117,7 +117,7 @@ class KeyService:
             "is_active": c.is_active,
         }
 
-    async def list_app_clients(
+    def list_app_clients(
         self,
         org_id: str,
         is_active: Optional[bool] = None,
@@ -129,10 +129,25 @@ class KeyService:
             stmt = stmt.where(AppClient.is_active == is_active)
 
         stmt = stmt.order_by(AppClient.created_at.desc()).offset(offset).limit(limit)
-        res = await self.session.execute(stmt)
+        res = self.session.execute(stmt)
         return [self._client_to_response(c) for c in res.scalars().all()]
 
-    async def update_app_client(self, client_id: str, data: AppClientUpdate) -> Optional[AppClientResponse]:
+    def list_app_clients_admin(
+        self,
+        is_active: Optional[bool] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[AppClientResponse]:
+        """List app clients across all organizations (platform admin)."""
+        stmt = select(AppClient)
+        if is_active is not None:
+            stmt = stmt.where(AppClient.is_active == is_active)
+
+        stmt = stmt.order_by(AppClient.created_at.desc()).offset(offset).limit(limit)
+        res = self.session.execute(stmt)
+        return [self._client_to_response(c) for c in res.scalars().all()]
+
+    def update_app_client(self, client_id: str, data: AppClientUpdate) -> Optional[AppClientResponse]:
         values: Dict[str, Any] = {"updated_at": datetime.utcnow()}
         if data.name is not None:
             values["name"] = data.name
@@ -148,23 +163,23 @@ class KeyService:
             .returning(AppClient)
         )
         try:
-            res = await self.session.execute(stmt)
+            res = self.session.execute(stmt)
             row = res.fetchone()
             if not row:
-                await self.session.rollback()
+                self.session.rollback()
                 return None
-            await self.session.commit()
+            self.session.commit()
             return self._client_to_response(row[0])
         except IntegrityError:
-            await self.session.rollback()
+            self.session.rollback()
             raise ValueError("App client name already exists in this organization")
 
-    async def rotate_client_secret(self, client_id: str) -> Tuple[str, str]:
+    def rotate_client_secret(self, client_id: str) -> Tuple[str, str]:
         """
         Rotate OAuth client secret.
         Returns: (client_id, new_secret) - secret shown only once
         """
-        res = await self.session.execute(select(AppClient).where(AppClient.id == client_id))
+        res = self.session.execute(select(AppClient).where(AppClient.id == client_id))
         c = res.scalar_one_or_none()
         if not c:
             raise ValueError("App client not found")
@@ -174,13 +189,13 @@ class KeyService:
         c.client_secret_hash = secret_hash
         c.updated_at = datetime.utcnow()
 
-        await self.session.commit()
+        self.session.commit()
         return c.client_id, new_secret
 
-    async def deactivate_app_client(self, client_id: str) -> bool:
+    def deactivate_app_client(self, client_id: str) -> bool:
         """Deactivate an app client and revoke all its API keys (atomic)."""
         # Transactional approach: update client + keys before commit
-        res = await self.session.execute(select(AppClient).where(AppClient.id == client_id))
+        res = self.session.execute(select(AppClient).where(AppClient.id == client_id))
         c = res.scalar_one_or_none()
         if not c:
             return False
@@ -189,7 +204,7 @@ class KeyService:
         c.updated_at = datetime.utcnow()
 
         # revoke keys for that client
-        await self.session.execute(
+        self.session.execute(
             update(APIKey)
             .where(APIKey.app_client_id == client_id, APIKey.is_active == True)  # noqa: E712
             .values(
@@ -198,17 +213,17 @@ class KeyService:
             )
         )
 
-        await self.session.commit()
+        self.session.commit()
         return True
 
     # ================== API Keys ==================
 
-    async def create_api_key(self, app_client_id: str, data: APIKeyCreate) -> APIKeyCreated:
+    def create_api_key(self, app_client_id: str, data: APIKeyCreate) -> APIKeyCreated:
         """
         Create a new API key for an app client.
         Returns key with full plaintext (shown only once).
         """
-        res = await self.session.execute(select(AppClient).where(AppClient.id == app_client_id))
+        res = self.session.execute(select(AppClient).where(AppClient.id == app_client_id))
         c = res.scalar_one_or_none()
         if not c:
             raise ValueError("App client not found")
@@ -228,13 +243,13 @@ class KeyService:
         self.session.add(k)
 
         try:
-            await self.session.commit()
+            self.session.commit()
         except IntegrityError:
-            await self.session.rollback()
+            self.session.rollback()
             # could be unique(app_client_id, name) or other
             raise ValueError("API key already exists")
 
-        await self.session.refresh(k)
+        self.session.refresh(k)
 
         return APIKeyCreated(
             id=str(k.id),
@@ -248,12 +263,12 @@ class KeyService:
             created_at=k.created_at,
         )
 
-    async def get_api_key(self, key_id: str) -> Optional[APIKeyResponse]:
-        res = await self.session.execute(select(APIKey).where(APIKey.id == key_id))
+    def get_api_key(self, key_id: str) -> Optional[APIKeyResponse]:
+        res = self.session.execute(select(APIKey).where(APIKey.id == key_id))
         k = res.scalar_one_or_none()
         return self._key_to_response(k) if k else None
 
-    async def list_api_keys(
+    def list_api_keys(
         self,
         app_client_id: str,
         is_active: Optional[bool] = None,
@@ -265,15 +280,15 @@ class KeyService:
             stmt = stmt.where(APIKey.is_active == is_active)
 
         stmt = stmt.order_by(APIKey.created_at.desc()).offset(offset).limit(limit)
-        res = await self.session.execute(stmt)
+        res = self.session.execute(stmt)
         return [self._key_to_response(k) for k in res.scalars().all()]
 
-    async def rotate_api_key(self, key_id: str) -> APIKeyCreated:
+    def rotate_api_key(self, key_id: str, revoked_by: Optional[str] = None) -> APIKeyCreated:
         """
         Rotate an API key - revokes old and creates new (atomic).
         Returns new key with plaintext (shown only once).
         """
-        res = await self.session.execute(select(APIKey).where(APIKey.id == key_id))
+        res = self.session.execute(select(APIKey).where(APIKey.id == key_id))
         old = res.scalar_one_or_none()
         if not old:
             raise ValueError("API key not found")
@@ -281,6 +296,8 @@ class KeyService:
         # revoke old
         old.is_active = False
         old.revoked_at = datetime.utcnow()
+        if hasattr(old, "revoked_by"):
+            old.revoked_by = revoked_by
 
         # create new
         full_key, prefix, key_hash = generate_api_key()
@@ -294,8 +311,8 @@ class KeyService:
         )
         self.session.add(new_key)
 
-        await self.session.commit()
-        await self.session.refresh(new_key)
+        self.session.commit()
+        self.session.refresh(new_key)
 
         return APIKeyCreated(
             id=str(new_key.id),
@@ -309,8 +326,8 @@ class KeyService:
             created_at=new_key.created_at,
         )
 
-    async def revoke_api_key(self, key_id: str, revoked_by: Optional[str] = None) -> bool:
-        res = await self.session.execute(select(APIKey).where(APIKey.id == key_id))
+    def revoke_api_key(self, key_id: str, revoked_by: Optional[str] = None) -> bool:
+        res = self.session.execute(select(APIKey).where(APIKey.id == key_id))
         k = res.scalar_one_or_none()
         if not k:
             return False
@@ -320,10 +337,10 @@ class KeyService:
         if hasattr(k, "revoked_by"):
             k.revoked_by = revoked_by
 
-        await self.session.commit()
+        self.session.commit()
         return True
 
-    async def list_all_keys_admin(
+    def list_all_keys_admin(
         self,
         org_id: Optional[str] = None,
         is_active: Optional[bool] = None,
@@ -342,7 +359,7 @@ class KeyService:
             stmt = stmt.where(APIKey.is_active == is_active)
 
         stmt = stmt.order_by(APIKey.created_at.desc()).offset(offset).limit(limit)
-        res = await self.session.execute(stmt)
+        res = self.session.execute(stmt)
 
         out: List[dict] = []
         for k, c in res.all():

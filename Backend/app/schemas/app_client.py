@@ -1,15 +1,3 @@
-"""
-Pydantic schemas for App Clients + API Keys.
-
-Rules:
-- Schemas do NOT generate DB fields (id, timestamps). DB does.
-- "secret shown once" behavior:
-  - AppClientWithSecret returns client_secret only at creation.
-  - APIKeyCreated returns api_key only at creation.
-"""
-
-from __future__ import annotations
-
 from datetime import datetime
 from typing import Optional
 from uuid import UUID
@@ -17,9 +5,6 @@ from uuid import UUID
 from pydantic import BaseModel, Field, ConfigDict
 
 
-# -------------------------
-# App Client
-# -------------------------
 
 class AppClientBase(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
@@ -27,7 +12,7 @@ class AppClientBase(BaseModel):
 
 
 class AppClientCreate(AppClientBase):
-    org_id: UUID  # if org_id comes from auth context, remove from body
+    org_id: UUID  
 
 
 class AppClientUpdate(BaseModel):
@@ -48,24 +33,17 @@ class AppClientResponse(AppClientBase):
 
 
 class AppClientWithSecret(AppClientResponse):
-    """
-    Only returned once at creation time.
-    Never store or re-display plaintext secret later.
-    """
     client_secret: str
 
 
-# -------------------------
-# API Keys
-# -------------------------
+
 
 class APIKeyCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
     expires_at: Optional[datetime] = None
 
 
-class APIKeyUpdate(BaseModel):
-    # optional future extension
+class APIKeyUpdate(BaseModel): 
     name: Optional[str] = Field(None, min_length=2, max_length=100)
     is_active: Optional[bool] = None
     expires_at: Optional[datetime] = None
@@ -87,24 +65,20 @@ class APIKeyResponse(BaseModel):
 
 
 class APIKeyCreated(APIKeyResponse):
-    """
-    Only returned once at creation time.
-    Never store or re-display plaintext api_key later.
-    """
     api_key: str
 
 
 class APIKeyRotate(BaseModel):
-    """
-    Request body for rotate.
-    No fields required; endpoint action rotates.
-    """
     pass
 
 
-# -------------------------
-# Rate limiting
-# -------------------------
+class RotateSecretResponse(BaseModel):
+    client_id: UUID
+    client_secret: str
+    message: str
+
+
+
 
 class RateLimitConfig(BaseModel):
     requests_per_minute: int = 100

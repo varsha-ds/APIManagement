@@ -1,21 +1,5 @@
 """
 API Access & Management Platform
-================================
-
-A backend-first API Gateway and Developer Platform built with FastAPI.
-
-Tech Stack:
-- FastAPI
-- Postgres
-- SQLAlchemy
-- Alembic
-
-Features:
-- Multi-auth: JWT, API Keys, OAuth2 Client Credentials
-- RBAC + Scope-based authorization
-- API Product lifecycle management
-- Subscription approval workflow
-- Rate limiting and audit logging
 """
 
 from fastapi import FastAPI, Request, HTTPException
@@ -30,10 +14,8 @@ import logging
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.database import SessionLocal  # from your database.py
-# If you want: from app.database import engine
+from app.database import SessionLocal 
 
-# Import routers (Postgres-migrated routes)
 from app.routes.auth_routes import router as auth_router
 from app.routes.org_routes import router as org_router
 from app.routes.api_routes import router as api_router
@@ -42,11 +24,9 @@ from app.routes.subscription_routes import router as subscription_router
 from app.routes.oauth_routes import router as oauth_router
 from app.routes.admin_routes import router as admin_router
 
-# If your audit logger needs initialization, keep it;
-# best is to make audit_log write using DI session instead.
 from app.middleware.audit_log import audit_logger
 
-# Load environment variables
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
@@ -69,14 +49,6 @@ def db_healthcheck() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application lifespan handler.
-
-    Notes:
-    - With SQLAlchemy sync engine, we don't hold a global DB connection on app.state.
-    - We optionally run a startup health check.
-    - Migrations are handled by Alembic (run separately).
-    """
     # Startup
     try:
         db_healthcheck()
@@ -85,8 +57,6 @@ async def lifespan(app: FastAPI):
         logger.error(f"Database connection failed: {e}", exc_info=True)
         raise RuntimeError("Database connection failed") from e
 
-    # Optional: if your audit logger needs setup, wire it to SessionLocal
-    # Recommended: audit_logger should use DI session instead, but if you keep a global:
     audit_logger.set_session_factory(SessionLocal)
 
     logger.info("API Access & Management Platform started")
@@ -101,21 +71,6 @@ app = FastAPI(
 ## Overview
 
 A production-style backend platform for managing API access and governance.
-
-### Features
-
-- **Multi-Auth Support**: JWT tokens, API Keys, OAuth2 Client Credentials
-- **RBAC + Scopes**: Role-based access control with fine-grained scope permissions
-- **API Lifecycle**: Draft → Published → Deprecated workflow
-- **Subscription Workflow**: Request → Pending → Approved/Denied
-- **Rate Limiting**: Per-client rate limiting with configurable limits
-- **Audit Logging**: Complete audit trail for all operations
-
-### Authentication Methods
-
-1. **User JWT**: For management operations
-2. **API Key**: For machine-to-machine API access (`X-API-Key`)
-3. **OAuth2**: Client credentials flow (`/api/oauth/token`)
 """,
     version="1.0.0",
     lifespan=lifespan,

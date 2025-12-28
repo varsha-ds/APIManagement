@@ -1,11 +1,3 @@
-"""
-Pydantic schemas for Authentication.
-
-These define request/response payloads and JWT payload shapes.
-"""
-
-from __future__ import annotations
-
 from pydantic import BaseModel, Field, EmailStr, ConfigDict
 from typing import Optional
 from datetime import datetime
@@ -19,9 +11,6 @@ class UserRole(str, Enum):
     DEVELOPER = "developer"
 
 
-# -------------------------
-# User requests
-# -------------------------
 
 class UserCreate(BaseModel):
     email: EmailStr
@@ -29,8 +18,7 @@ class UserCreate(BaseModel):
     name: str = Field(..., min_length=2)
     role: UserRole = UserRole.DEVELOPER
 
-    # If org_id is derived from inviter/admin context, remove from body.
-    org_id: Optional[UUID] = None
+
 
 
 class UserLogin(BaseModel):
@@ -38,9 +26,7 @@ class UserLogin(BaseModel):
     password: str
 
 
-# -------------------------
-# User responses
-# -------------------------
+
 
 class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -55,9 +41,7 @@ class UserResponse(BaseModel):
     updated_at: datetime
 
 
-# -------------------------
-# Tokens
-# -------------------------
+
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -70,12 +54,19 @@ class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
 
+class LoginResponse(BaseModel):
+    user: UserResponse
+    tokens: TokenResponse
+
+
+class UserUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    is_active: Optional[bool] = None
+    org_id: Optional[UUID] = None
+    role: Optional[UserRole] = None
+
+
 class TokenPayload(BaseModel):
-    """
-    JWT claims payload shape.
-    NOTE: In JWT, exp/iat are often numeric timestamps, but you can model them
-    as datetime if you convert when encoding/decoding.
-    """
     sub: str  # user_id (string in JWT)
     email: EmailStr
     role: UserRole

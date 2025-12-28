@@ -27,6 +27,7 @@ from app.schemas.subscription import (
     SubscriptionResponse,
     SubscriptionStatus,
 )
+from app.models.subscription import Subscription
 from app.schemas.auth import UserRole
 from app.middleware.auth_middleware import get_current_user, AuthContext, RoleChecker
 from app.middleware.audit_log import audit_log
@@ -49,6 +50,29 @@ def get_key_service(db: Session = Depends(get_db)) -> KeyService:
 def get_api_service(db: Session = Depends(get_db)) -> APIService:
     return APIService(db)
 
+def _org_ids_match(left: Optional[UUID], right: Optional[str]) -> bool:
+    if not left or not right:
+        return False
+    return str(left) == str(right)
+
+def _subscription_to_response(sub: SubscriptionResponse | Subscription) -> SubscriptionResponse:
+    requested = [s.name for s in getattr(sub, "requested_scopes", [])]
+    granted = [s.name for s in getattr(sub, "granted_scopes", [])]
+    return SubscriptionResponse(
+        id=sub.id,
+        app_client_id=sub.app_client_id,
+        api_version_id=sub.api_version_id,
+        status=sub.status,
+        requested_scopes=requested,
+        granted_scopes=granted,
+        rate_limit_per_minute=sub.rate_limit_per_minute,
+        justification=sub.justification,
+        denial_reason=sub.denial_reason,
+        approved_by=sub.approved_by,
+        approved_at=sub.approved_at,
+        created_at=sub.created_at,
+        updated_at=sub.updated_at,
+    )
 
 # -------------------------
 # Create subscription request
@@ -87,7 +111,7 @@ def create_subscription(
         raise HTTPException(status_code=404, detail="API product not found")
 
     # Non-platform users can only request within their org
-    if auth.role != UserRole.PLATFORM_ADMIN and product.org_id != auth.org_id:
+    if auth.role != UserRole.PLATFORM_ADMIN and not _org_ids_match(product.org_id, auth.org_id):
         raise HTTPException(status_code=403, detail="Access denied")
 
     # IMPORTANT: Your SubscriptionCreate currently has no app_client_id, but subscription needs it.
@@ -116,8 +140,7 @@ def create_subscription(
             details={"api_version_id": str(data.api_version_id)},
             request=request,
         )
-
-        return sub
+        return _subscription_to_response(sub)
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -139,18 +162,13 @@ def list_subscriptions(
     auth: AuthContext = Depends(get_current_user),
     sub_service: SubscriptionService = Depends(get_subscription_service),
 ):
-    """
-    List subscriptions.
 
-    - PLATFORM_ADMIN can see all (optionally filter by org_id)
-    - Others can only see their org's subscriptions
-    """
     if auth.role != UserRole.PLATFORM_ADMIN:
         org_id = auth.org_id
         if not org_id:
             return []
 
-    return sub_service.list_subscriptions(
+    subs = sub_service.list_subscriptions(
         org_id=org_id,
         status=status,
         api_version_id=api_version_id,
@@ -158,6 +176,7 @@ def list_subscriptions(
         limit=limit,
         offset=offset,
     )
+    return [_subscription_to_response(s) for s in subs]
 
 
 @router.get("/{subscription_id}", response_model=SubscriptionResponse)
@@ -172,15 +191,13 @@ def get_subscription(
 
     # enforce org access for non-platform admin
     if auth.role != UserRole.PLATFORM_ADMIN:
-        if not auth.org_id or sub_service.get_subscription_org_id(subscription_id) != auth.org_id:
+        sub_org_id = sub_service.get_subscription_org_id(subscription_id)
+        if not auth.org_id or not _org_ids_match(sub_org_id, auth.org_id):
             raise HTTPException(status_code=403, detail="Access denied")
 
-    return sub
+    return _subscription_to_response(sub)
 
 
-# -------------------------
-# Approve / deny / revoke
-# -------------------------
 
 @router.post("/{subscription_id}/approve", response_model=SubscriptionResponse)
 def approve_subscription(
@@ -190,13 +207,10 @@ def approve_subscription(
     auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN])),
     sub_service: SubscriptionService = Depends(get_subscription_service),
 ):
-    """
-    Approve a subscription request.
-    - ORG_ADMIN can only approve within their org
-    """
+    
     if auth.role == UserRole.ORG_ADMIN:
         org_id = sub_service.get_subscription_org_id(subscription_id)
-        if not org_id or auth.org_id != org_id:
+        if not org_id or not _org_ids_match(org_id, auth.org_id):
             raise HTTPException(status_code=403, detail="Access denied")
 
     try:
@@ -219,8 +233,7 @@ def approve_subscription(
             details={"granted_scopes": data.granted_scopes, "rate_limit_per_minute": data.rate_limit_per_minute},
             request=request,
         )
-
-        return sub
+        return _subscription_to_response(sub)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -233,19 +246,16 @@ def deny_subscription(
     auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN])),
     sub_service: SubscriptionService = Depends(get_subscription_service),
 ):
-    """
-    Deny a subscription request.
-    - ORG_ADMIN can only deny within their org
-    """
+    
     if auth.role == UserRole.ORG_ADMIN:
         org_id = sub_service.get_subscription_org_id(subscription_id)
-        if not org_id or auth.org_id != org_id:
+        if not org_id or not _org_ids_match(org_id, auth.org_id):
             raise HTTPException(status_code=403, detail="Access denied")
 
     sub = sub_service.deny_subscription(
         subscription_id=subscription_id,
         denial_reason=data.reason,
-        approved_by_user_id=auth.identity_id,  # "decided_by"
+        decided_by_user_id=auth.identity_id,
     )
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
@@ -260,7 +270,7 @@ def deny_subscription(
         request=request,
     )
 
-    return sub
+    return _subscription_to_response(sub)
 
 
 @router.post("/{subscription_id}/revoke", response_model=SubscriptionResponse)
@@ -270,13 +280,10 @@ def revoke_subscription(
     auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN])),
     sub_service: SubscriptionService = Depends(get_subscription_service),
 ):
-    """
-    Revoke an approved subscription.
-    - ORG_ADMIN can only revoke within their org
-    """
+    
     if auth.role == UserRole.ORG_ADMIN:
         org_id = sub_service.get_subscription_org_id(subscription_id)
-        if not org_id or auth.org_id != org_id:
+        if not org_id or not _org_ids_match(org_id, auth.org_id):
             raise HTTPException(status_code=403, detail="Access denied")
 
     sub = sub_service.revoke_subscription(subscription_id=subscription_id, revoked_by_user_id=auth.identity_id)
@@ -292,4 +299,4 @@ def revoke_subscription(
         request=request,
     )
 
-    return sub
+    return _subscription_to_response(sub)

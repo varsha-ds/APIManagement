@@ -14,9 +14,7 @@ from app.utils.security import (
     hash_password, verify_password,
     create_access_token, create_refresh_token, decode_token
 )
-
-# TODO: replace with your actual ORM import
-from app.models.auth import User  # <- adjust
+from app.models.auth import User 
 
 logger = logging.getLogger(__name__)
 

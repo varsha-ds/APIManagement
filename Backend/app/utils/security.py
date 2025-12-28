@@ -1,4 +1,3 @@
-"""Security utilities for password hashing, API key hashing, and JWT token management."""
 import os
 import secrets
 import hashlib
@@ -8,7 +7,7 @@ from typing import Optional, Dict, Any, Tuple, List
 
 try:
     from app.config import settings
-except Exception:  # pragma: no cover - settings import should succeed in app context
+except Exception:  
     settings = None
 
 import bcrypt
@@ -22,7 +21,7 @@ def _require_env(name: str) -> str:
     return val
 
 
-# ---- JWT Configuration ----
+
 JWT_SECRET = os.environ.get("JWT_SECRET") or (settings.secret_key if settings else None)
 if not JWT_SECRET:
     # Fail fast: prevents silent token invalidation across restarts/pods
@@ -41,7 +40,6 @@ API_KEY_PREFIX_LENGTH = int(os.environ.get("API_KEY_PREFIX_LENGTH", "8"))
 API_KEY_BYTES = int(os.environ.get("API_KEY_BYTES", "32"))  # bytes of entropy, not string length
 
 # Secret used to hash API keys / client secrets safely (HMAC).
-# You can reuse JWT_SECRET, but better to separate.
 API_KEY_HASH_SECRET = os.environ.get("API_KEY_HASH_SECRET", JWT_SECRET)
 
 

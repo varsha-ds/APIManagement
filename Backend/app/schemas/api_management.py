@@ -1,12 +1,3 @@
-"""
-Pydantic schemas for API Management.
-
-These are API contracts (request/response), not DB models.
-DB-generated fields like id/created_at/updated_at appear in Response schemas.
-"""
-
-from __future__ import annotations
-
 from datetime import datetime
 from enum import Enum
 from typing import Optional, List
@@ -29,9 +20,6 @@ class HTTPMethod(str, Enum):
     DELETE = "DELETE"
 
 
-# -------------------------
-# API Product
-# -------------------------
 
 class APIProductBase(BaseModel):
     name: str = Field(..., min_length=2, max_length=100)
@@ -39,11 +27,7 @@ class APIProductBase(BaseModel):
 
 
 class APIProductCreate(APIProductBase):
-    """
-    Client provides: name, description
-    Server/DB provides: id, timestamps, etc.
-    """
-    org_id: UUID  # if you derive org_id from auth context, remove this from Create
+    org_id: UUID 
 
 
 class APIProductUpdate(BaseModel):
@@ -57,14 +41,13 @@ class APIProductResponse(APIProductBase):
 
     id: UUID
     org_id: UUID
+    status: APIStatus
     is_active: bool
     created_at: datetime
     updated_at: datetime
 
 
-# -------------------------
-# API Version
-# -------------------------
+
 
 class APIVersionBase(BaseModel):
     version: str = Field(..., pattern=r"^v\d+(\.\d+)?$")       # v1, v1.0
@@ -91,9 +74,7 @@ class APIVersionResponse(APIVersionBase):
     updated_at: datetime
 
 
-# -------------------------
-# Scope
-# -------------------------
+
 
 class ScopeBase(BaseModel):
     name: str = Field(..., pattern=r"^[a-z]+\.[a-z]+$")  # orders.read
@@ -112,9 +93,7 @@ class ScopeResponse(ScopeBase):
     created_at: datetime
 
 
-# -------------------------
-# Endpoint
-# -------------------------
+
 
 class EndpointBase(BaseModel):
     method: HTTPMethod
@@ -137,10 +116,6 @@ class EndpointUpdate(BaseModel):
 
 
 class EndpointResponse(EndpointBase):
-    """
-    Lightweight response: scopes as strings.
-    Useful for most API clients.
-    """
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
@@ -152,10 +127,6 @@ class EndpointResponse(EndpointBase):
 
 
 class EndpointResponseDetailed(EndpointBase):
-    """
-    Detailed response: scopes expanded as objects.
-    Useful for admin UIs / internal tooling.
-    """
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID

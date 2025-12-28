@@ -1,5 +1,3 @@
-"""Audit log schemas (Pydantic)."""
-
 from datetime import datetime
 from typing import Optional, Dict, Any
 from uuid import UUID
@@ -15,7 +13,7 @@ class AuditLogResponse(BaseModel):
 
     action: str
 
-    actor_id: str
+    actor_id: Optional[str] = None
     actor_type: str
 
     resource_type: str

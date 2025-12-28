@@ -10,7 +10,6 @@ Assumptions:
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Depends, Request
-from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from sqlalchemy import func, case
 
@@ -30,14 +29,9 @@ from app.middleware.audit_log import audit_logger, audit_log
 from app.database import get_db
 
 from app.schemas.audit_log import AuditLogResponse
+from app.schemas.admin import SetupRequest
 
 router = APIRouter(prefix="/admin", tags=["Platform Administration"])
-
-
-class SetupRequest(BaseModel):
-    email: EmailStr
-    password: str
-    name: str
 
 
 @router.get("/audit-logs", response_model=List[AuditLogResponse])
@@ -63,7 +57,24 @@ def get_audit_logs(
         limit=limit,
         offset=offset,
     )
-    return logs
+    return [
+        AuditLogResponse(
+            id=log.id,
+            timestamp=log.timestamp,
+            action=log.action,
+            actor_id=str(log.actor_id) if log.actor_id else None,
+            actor_type=log.actor_type,
+            resource_type=log.resource_type,
+            resource_id=str(log.resource_id) if log.resource_id else None,
+            decision=log.decision,
+            reason=log.reason,
+            details=log.details,
+            ip_address=log.ip_address,
+            user_agent=log.user_agent,
+            request_id=log.request_id,
+        )
+        for log in logs
+    ]
 
 
 @router.get("/rate-limits/{key}")
@@ -96,6 +107,7 @@ def reset_rate_limit(
     return {"message": f"Rate limit reset for key: {key}"}
 
 
+PLATFORM_ADMIN_ROLE = "platform_admin" 
 @router.post("/setup")
 def initial_setup(
     data: SetupRequest,
@@ -104,19 +116,28 @@ def initial_setup(
 ):
     """
     Initial platform setup - creates first platform admin.
-    This endpoint only works if no users exist in the system.
+
+    Rules:
+    - Allowed only if NO platform admin exists yet.
+    - (Optional) even if other users exist, setup can still create the first platform admin.
+      This fixes the flaw where a non-admin user could be created first.
     """
+    # IMPORTANT: lock user rows to reduce race conditions on concurrent setup calls
+    # (Works best on Postgres; on SQLite it won't truly lock. Still okay for dev.)
     # "Setup only once" check
-    existing_user = db.query(User.id).limit(1).first()
-    if existing_user:
+    existing_admin = (
+        db.query(User.id)
+        .filter(User.role == PLATFORM_ADMIN_ROLE)
+        .with_for_update()  # row-level lock (best-effort)
+        .first()
+    )
+    if existing_admin:
         raise HTTPException(
             status_code=400,
-            detail="Setup already completed. Users already exist in the system.",
+            detail="Setup already completed. Platform admin already exists.",
         )
-
     # Import service here to avoid circular imports
     from app.services.auth_service import AuthService
-
     auth_service = AuthService(db)
 
     try:
@@ -134,7 +155,7 @@ def initial_setup(
             resource_id="initial_setup",
             request=request,
         )
-
+        db.commit()
         # Return a safe user payload (no password_hash)
         return {
             "message": "Platform setup complete. First admin user created.",
@@ -151,7 +172,11 @@ def initial_setup(
         }
 
     except ValueError as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        db.rollback()
+        raise
 
 
 @router.get("/stats")
