@@ -1,30 +1,25 @@
-
-"""Organization management service (Postgres/SQLAlchemy)."""
-from __future__ import annotations
-
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 import logging
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.schemas.organization import (
     OrganizationCreate, OrganizationUpdate,
     OrganizationResponse
 )
-from app.schemas.auth import UserResponse, UserRole  # if you want typed users
+from app.schemas.auth import UserResponse, UserRole  
 
-# TODO: replace with your actual ORM imports
-from app.models.organization import Organization  # <- adjust
-from app.models.auth import User  # <- adjust
+from app.models.organization import Organization  
+from app.models.auth import User  
 
 logger = logging.getLogger(__name__)
 
 
 class OrganizationService:
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: Session):
         self.session = session
 
     @staticmethod
@@ -51,26 +46,26 @@ class OrganizationService:
             updated_at=u.updated_at,
         )
 
-    async def create_organization(self, data: OrganizationCreate) -> OrganizationResponse:
+    def create_organization(self, data: OrganizationCreate) -> OrganizationResponse:
         """Create a new organization."""
         o = Organization(name=data.name, description=data.description, is_active=True)
         self.session.add(o)
         try:
-            await self.session.commit()
+            self.session.commit()
         except IntegrityError:
-            await self.session.rollback()
+            self.session.rollback()
             # unique(organizations.name)
             raise ValueError("Organization name already exists")
 
-        await self.session.refresh(o)
+        self.session.refresh(o)
         return self._org_to_response(o)
 
-    async def get_organization(self, org_id: str) -> Optional[OrganizationResponse]:
-        res = await self.session.execute(select(Organization).where(Organization.id == org_id))
+    def get_organization(self, org_id: str) -> Optional[OrganizationResponse]:
+        res = self.session.execute(select(Organization).where(Organization.id == org_id))
         o = res.scalar_one_or_none()
         return self._org_to_response(o) if o else None
 
-    async def list_organizations(
+    def list_organizations(
         self,
         is_active: Optional[bool] = None,
         limit: int = 100,
@@ -81,10 +76,10 @@ class OrganizationService:
             stmt = stmt.where(Organization.is_active == is_active)
 
         stmt = stmt.order_by(Organization.created_at.desc()).offset(offset).limit(limit)
-        res = await self.session.execute(stmt)
+        res = self.session.execute(stmt)
         return [self._org_to_response(o) for o in res.scalars().all()]
 
-    async def update_organization(self, org_id: str, data: OrganizationUpdate) -> Optional[OrganizationResponse]:
+    def update_organization(self, org_id: str, data: OrganizationUpdate) -> Optional[OrganizationResponse]:
         values: Dict[str, Any] = {"updated_at": datetime.utcnow()}
         if data.name is not None:
             values["name"] = data.name
@@ -101,32 +96,32 @@ class OrganizationService:
         )
 
         try:
-            res = await self.session.execute(stmt)
+            res = self.session.execute(stmt)
             row = res.fetchone()
             if not row:
-                await self.session.rollback()
+                self.session.rollback()
                 return None
-            await self.session.commit()
+            self.session.commit()
             return self._org_to_response(row[0])
         except IntegrityError:
-            await self.session.rollback()
+            self.session.rollback()
             raise ValueError("Organization name already exists")
 
-    async def delete_organization(self, org_id: str) -> bool:
+    def delete_organization(self, org_id: str) -> bool:
         """Soft delete organization (set is_active to False)."""
         stmt = (
             update(Organization)
             .where(Organization.id == org_id)
             .values(is_active=False, updated_at=datetime.utcnow())
         )
-        res = await self.session.execute(stmt)
-        await self.session.commit()
+        res = self.session.execute(stmt)
+        self.session.commit()
         return res.rowcount > 0
 
-    async def add_user_to_org(self, user_id: str, org_id: str) -> bool:
+    def add_user_to_org(self, user_id: str, org_id: str) -> bool:
         """Add user to organization."""
         # ensure org exists & active
-        res = await self.session.execute(select(Organization).where(Organization.id == org_id))
+        res = self.session.execute(select(Organization).where(Organization.id == org_id))
         org = res.scalar_one_or_none()
         if not org:
             raise ValueError("Organization not found")
@@ -138,22 +133,22 @@ class OrganizationService:
             .where(User.id == user_id)
             .values(org_id=org_id, updated_at=datetime.utcnow())
         )
-        res2 = await self.session.execute(stmt)
-        await self.session.commit()
+        res2 = self.session.execute(stmt)
+        self.session.commit()
         return res2.rowcount > 0
 
-    async def remove_user_from_org(self, user_id: str) -> bool:
+    def remove_user_from_org(self, user_id: str) -> bool:
         """Remove user from organization."""
         stmt = (
             update(User)
             .where(User.id == user_id)
             .values(org_id=None, updated_at=datetime.utcnow())
         )
-        res = await self.session.execute(stmt)
-        await self.session.commit()
+        res = self.session.execute(stmt)
+        self.session.commit()
         return res.rowcount > 0
 
-    async def get_org_users(
+    def get_org_users(
         self,
         org_id: str,
         limit: int = 100,
@@ -167,5 +162,5 @@ class OrganizationService:
             .offset(offset)
             .limit(limit)
         )
-        res = await self.session.execute(stmt)
+        res = self.session.execute(stmt)
         return [self._user_to_response(u) for u in res.scalars().all()]

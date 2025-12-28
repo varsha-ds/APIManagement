@@ -1,13 +1,10 @@
-"""API Management service (Postgres/SQLAlchemy)."""
-from __future__ import annotations
-
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 import logging
-from sqlalchemy import select, update, and_
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.schemas.api_management import (
     APIProductCreate, APIProductUpdate, APIProductResponse,
@@ -17,25 +14,24 @@ from app.schemas.api_management import (
     APIStatus
 )
 
-# TODO: replace these with your actual SQLAlchemy ORM models
-from app.models.api_management import APIProduct, APIVersion, Endpoint, Scope  # <- adjust
+
+from app.models.api_management import APIProduct, APIVersion, Endpoint, Scope  
 
 logger = logging.getLogger(__name__)
 
 
 class APIService:
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: Session):
         self.session = session
 
-    # ------------------ helpers ------------------
-
     @staticmethod
-    def _product_to_response(p: APIProduct) -> APIProductResponse:
+    def _product_to_response(p: APIProduct, status: APIStatus) -> APIProductResponse:
         return APIProductResponse(
             id=str(p.id),
             org_id=str(p.org_id),
             name=p.name,
             description=p.description,
+            status=status,
             is_active=p.is_active,
             created_at=p.created_at,
             updated_at=p.updated_at,
@@ -56,14 +52,19 @@ class APIService:
 
     @staticmethod
     def _endpoint_to_response(e: Endpoint) -> EndpointResponse:
+        scope_items = e.required_scopes or []
+        scope_names = [
+            s.name if hasattr(s, "name") else str(s)
+            for s in scope_items
+        ]
         return EndpointResponse(
             id=str(e.id),
             version_id=str(e.version_id),
-            method=e.method,  # prefer storing as enum in DB
+            method=e.method,  
             path=e.path,
             summary=e.summary,
             description=e.description,
-            required_scopes=e.required_scopes or [],
+            required_scopes=scope_names,
             is_active=e.is_active,
             created_at=e.created_at,
             updated_at=e.updated_at,
@@ -79,9 +80,19 @@ class APIService:
             created_at=s.created_at,
         )
 
-    # ================== API Products ==================
+    
 
-    async def create_product(self, org_id: str, data: APIProductCreate) -> APIProductResponse:
+    def _get_product_status(self, product_id: str) -> APIStatus:
+        stmt = select(APIVersion.status).where(APIVersion.product_id == product_id)
+        res = self.session.execute(stmt)
+        statuses = {row[0] for row in res.all()}
+        if APIStatus.PUBLISHED in statuses:
+            return APIStatus.PUBLISHED
+        if APIStatus.DEPRECATED in statuses:
+            return APIStatus.DEPRECATED
+        return APIStatus.DRAFT
+
+    def create_product(self, org_id: str, data: APIProductCreate) -> APIProductResponse:
         p = APIProduct(
             org_id=org_id,
             name=data.name,
@@ -89,23 +100,26 @@ class APIService:
         )
         self.session.add(p)
         try:
-            await self.session.commit()
+            self.session.commit()
         except IntegrityError:
-            await self.session.rollback()
-            # assumes unique (org_id, name)
+            self.session.rollback()
             raise ValueError("API product name already exists in this organization")
-        await self.session.refresh(p)
-        return self._product_to_response(p)
+        self.session.refresh(p)
+        return self._product_to_response(p, APIStatus.DRAFT)
 
-    async def get_product(self, product_id: str) -> Optional[APIProductResponse]:
-        res = await self.session.execute(select(APIProduct).where(APIProduct.id == product_id))
+    def get_product(self, product_id: str) -> Optional[APIProductResponse]:
+        res = self.session.execute(select(APIProduct).where(APIProduct.id == product_id))
         p = res.scalar_one_or_none()
-        return self._product_to_response(p) if p else None
+        if not p:
+            return None
+        status = self._get_product_status(product_id)
+        return self._product_to_response(p, status)
 
-    async def list_products(
+    def list_products(
         self,
         org_id: Optional[str] = None,
         is_active: Optional[bool] = None,
+        status: Optional[APIStatus] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> List[APIProductResponse]:
@@ -114,12 +128,23 @@ class APIService:
             stmt = stmt.where(APIProduct.org_id == org_id)
         if is_active is not None:
             stmt = stmt.where(APIProduct.is_active == is_active)
+        if status is not None:
+            if status == APIStatus.PUBLISHED:
+                published = select(APIVersion.product_id).where(APIVersion.status == APIStatus.PUBLISHED)
+                stmt = stmt.where(APIProduct.id.in_(published))
+            elif status == APIStatus.DEPRECATED:
+                deprecated = select(APIVersion.product_id).where(APIVersion.status == APIStatus.DEPRECATED)
+                stmt = stmt.where(APIProduct.id.in_(deprecated))
+            else:
+                non_draft = select(APIVersion.product_id).where(APIVersion.status != APIStatus.DRAFT)
+                stmt = stmt.where(~APIProduct.id.in_(non_draft))
 
         stmt = stmt.order_by(APIProduct.created_at.desc()).offset(offset).limit(limit)
-        res = await self.session.execute(stmt)
-        return [self._product_to_response(p) for p in res.scalars().all()]
+        res = self.session.execute(stmt)
+        products = res.scalars().all()
+        return [self._product_to_response(p, self._get_product_status(p.id)) for p in products]
 
-    async def update_product(self, product_id: str, data: APIProductUpdate) -> Optional[APIProductResponse]:
+    def update_product(self, product_id: str, data: APIProductUpdate) -> Optional[APIProductResponse]:
         values: Dict[str, Any] = {}
         if data.name is not None:
             values["name"] = data.name
@@ -129,7 +154,7 @@ class APIService:
             values["is_active"] = data.is_active
 
         if not values:
-            return await self.get_product(product_id)
+            return self.get_product(product_id)
 
         values["updated_at"] = datetime.utcnow()
 
@@ -140,23 +165,21 @@ class APIService:
             .returning(APIProduct)
         )
         try:
-            res = await self.session.execute(stmt)
+            res = self.session.execute(stmt)
             row = res.fetchone()
             if not row:
-                await self.session.rollback()
+                self.session.rollback()
                 return None
-            await self.session.commit()
+            self.session.commit()
             p = row[0]
-            return self._product_to_response(p)
+            return self._product_to_response(p, self._get_product_status(product_id))
         except IntegrityError:
-            await self.session.rollback()
+            self.session.rollback()
             raise ValueError("API product name already exists in this organization")
 
-    # ================== API Versions ==================
 
-    async def create_version(self, product_id: str, data: APIVersionCreate) -> APIVersionResponse:
-        # Ensure product exists
-        if not await self.get_product(product_id):
+    def create_version(self, product_id: str, data: APIVersionCreate) -> APIVersionResponse:
+        if not self.get_product(product_id):
             raise ValueError("API product not found")
 
         v = APIVersion(
@@ -168,20 +191,19 @@ class APIService:
         )
         self.session.add(v)
         try:
-            await self.session.commit()
+            self.session.commit()
         except IntegrityError:
-            await self.session.rollback()
-            # assumes unique (product_id, version)
+            self.session.rollback()
             raise ValueError("Version already exists for this product")
-        await self.session.refresh(v)
+        self.session.refresh(v)
         return self._version_to_response(v)
 
-    async def get_version(self, version_id: str) -> Optional[APIVersionResponse]:
-        res = await self.session.execute(select(APIVersion).where(APIVersion.id == version_id))
+    def get_version(self, version_id: str) -> Optional[APIVersionResponse]:
+        res = self.session.execute(select(APIVersion).where(APIVersion.id == version_id))
         v = res.scalar_one_or_none()
         return self._version_to_response(v) if v else None
 
-    async def list_versions(
+    def list_versions(
         self,
         product_id: str,
         status: Optional[APIStatus] = None,
@@ -192,10 +214,10 @@ class APIService:
         if status:
             stmt = stmt.where(APIVersion.status == status)
         stmt = stmt.order_by(APIVersion.created_at.desc()).offset(offset).limit(limit)
-        res = await self.session.execute(stmt)
+        res = self.session.execute(stmt)
         return [self._version_to_response(v) for v in res.scalars().all()]
 
-    async def update_version(self, version_id: str, data: APIVersionUpdate) -> Optional[APIVersionResponse]:
+    def update_version(self, version_id: str, data: APIVersionUpdate) -> Optional[APIVersionResponse]:
         values: Dict[str, Any] = {"updated_at": datetime.utcnow()}
         if data.description is not None:
             values["description"] = data.description
@@ -208,50 +230,76 @@ class APIService:
             .values(**values)
             .returning(APIVersion)
         )
-        res = await self.session.execute(stmt)
+        res = self.session.execute(stmt)
         row = res.fetchone()
         if not row:
-            await self.session.rollback()
+            self.session.rollback()
             return None
-        await self.session.commit()
+        self.session.commit()
         return self._version_to_response(row[0])
 
-    async def publish_version(self, version_id: str) -> Optional[APIVersionResponse]:
-        return await self.update_version(version_id, APIVersionUpdate(status=APIStatus.PUBLISHED))
+    def publish_version(self, version_id: str) -> Optional[APIVersionResponse]:
+        return self.update_version(version_id, APIVersionUpdate(status=APIStatus.PUBLISHED))
 
-    async def deprecate_version(self, version_id: str) -> Optional[APIVersionResponse]:
-        return await self.update_version(version_id, APIVersionUpdate(status=APIStatus.DEPRECATED))
+    def deprecate_version(self, version_id: str) -> Optional[APIVersionResponse]:
+        version = self.update_version(version_id, APIVersionUpdate(status=APIStatus.DEPRECATED))
+        if not version:
+            return None
 
-    # ================== Endpoints ==================
+        self.session.execute(
+            update(Endpoint)
+            .where(Endpoint.version_id == version_id, Endpoint.is_active == True)  
+            .values(is_active=False, updated_at=datetime.utcnow())
+        )
+        self.session.commit()
+        return version
 
-    async def create_endpoint(self, version_id: str, data: EndpointCreate) -> EndpointResponse:
-        if not await self.get_version(version_id):
+
+    def create_endpoint(self, version_id: str, data: EndpointCreate) -> EndpointResponse:
+        version = self.session.execute(
+            select(APIVersion).where(APIVersion.id == version_id)
+        ).scalar_one_or_none()
+        if not version:
             raise ValueError("API version not found")
+
+        scope_names = data.required_scopes or []
+        scopes: List[Scope] = []
+        if scope_names:
+            res = self.session.execute(
+                select(Scope).where(
+                    Scope.product_id == version.product_id,
+                    Scope.name.in_(scope_names),
+                )
+            )
+            scopes = res.scalars().all()
+            found = {s.name for s in scopes}
+            missing = sorted(set(scope_names) - found)
+            if missing:
+                raise ValueError(f"Unknown scopes: {', '.join(missing)}")
 
         e = Endpoint(
             version_id=version_id,
-            method=data.method,   # store enum
+            method=data.method,   
             path=data.path,
             summary=data.summary,
             description=data.description,
-            required_scopes=data.required_scopes or [],
         )
+        e.required_scopes = scopes
         self.session.add(e)
         try:
-            await self.session.commit()
+            self.session.commit()
         except IntegrityError:
-            await self.session.rollback()
-            # assumes unique (version_id, method, path)
+            self.session.rollback()
             raise ValueError("Endpoint already exists")
-        await self.session.refresh(e)
+        self.session.refresh(e)
         return self._endpoint_to_response(e)
 
-    async def get_endpoint(self, endpoint_id: str) -> Optional[EndpointResponse]:
-        res = await self.session.execute(select(Endpoint).where(Endpoint.id == endpoint_id))
+    def get_endpoint(self, endpoint_id: str) -> Optional[EndpointResponse]:
+        res = self.session.execute(select(Endpoint).where(Endpoint.id == endpoint_id))
         e = res.scalar_one_or_none()
         return self._endpoint_to_response(e) if e else None
 
-    async def list_endpoints(
+    def list_endpoints(
         self,
         version_id: str,
         is_active: Optional[bool] = None,
@@ -262,68 +310,84 @@ class APIService:
         if is_active is not None:
             stmt = stmt.where(Endpoint.is_active == is_active)
         stmt = stmt.order_by(Endpoint.created_at.asc()).offset(offset).limit(limit)
-        res = await self.session.execute(stmt)
+        res = self.session.execute(stmt)
         return [self._endpoint_to_response(e) for e in res.scalars().all()]
 
-    async def update_endpoint(self, endpoint_id: str, data: EndpointUpdate) -> Optional[EndpointResponse]:
-        values: Dict[str, Any] = {"updated_at": datetime.utcnow()}
-        if data.summary is not None:
-            values["summary"] = data.summary
-        if data.description is not None:
-            values["description"] = data.description
-        if data.required_scopes is not None:
-            values["required_scopes"] = data.required_scopes
-        if data.is_active is not None:
-            values["is_active"] = data.is_active
-
-        stmt = (
-            update(Endpoint)
-            .where(Endpoint.id == endpoint_id)
-            .values(**values)
-            .returning(Endpoint)
-        )
-        res = await self.session.execute(stmt)
-        row = res.fetchone()
-        if not row:
-            await self.session.rollback()
+    def update_endpoint(self, endpoint_id: str, data: EndpointUpdate) -> Optional[EndpointResponse]:
+        e = self.session.execute(
+            select(Endpoint).where(Endpoint.id == endpoint_id)
+        ).scalar_one_or_none()
+        if not e:
             return None
-        await self.session.commit()
-        return self._endpoint_to_response(row[0])
 
-    # ================== Scopes ==================
+        if data.summary is not None:
+            e.summary = data.summary
+        if data.description is not None:
+            e.description = data.description
+        if data.is_active is not None:
+            e.is_active = data.is_active
 
-    async def create_scope(self, product_id: str, data: ScopeCreate) -> ScopeResponse:
-        if not await self.get_product(product_id):
+        if data.required_scopes is not None:
+            version = self.session.execute(
+                select(APIVersion).where(APIVersion.id == e.version_id)
+            ).scalar_one_or_none()
+            if not version:
+                raise ValueError("API version not found")
+
+            scope_names = data.required_scopes or []
+            scopes: List[Scope] = []
+            if scope_names:
+                res = self.session.execute(
+                    select(Scope).where(
+                        Scope.product_id == version.product_id,
+                        Scope.name.in_(scope_names),
+                    )
+                )
+                scopes = res.scalars().all()
+                found = {s.name for s in scopes}
+                missing = sorted(set(scope_names) - found)
+                if missing:
+                    raise ValueError(f"Unknown scopes: {', '.join(missing)}")
+            e.required_scopes = scopes
+
+        e.updated_at = datetime.utcnow()
+        self.session.commit()
+        self.session.refresh(e)
+        return self._endpoint_to_response(e)
+
+
+
+    def create_scope(self, product_id: str, data: ScopeCreate) -> ScopeResponse:
+        if not self.get_product(product_id):
             raise ValueError("API product not found")
 
         s = Scope(product_id=product_id, name=data.name, description=data.description)
         self.session.add(s)
         try:
-            await self.session.commit()
+            self.session.commit()
         except IntegrityError:
-            await self.session.rollback()
+            self.session.rollback()
             raise ValueError("Scope already exists")
-        await self.session.refresh(s)
+        self.session.refresh(s)
         return self._scope_to_response(s)
 
-    async def list_scopes(self, product_id: str, limit: int = 100) -> List[ScopeResponse]:
+    def list_scopes(self, product_id: str, limit: int = 100) -> List[ScopeResponse]:
         stmt = select(Scope).where(Scope.product_id == product_id).order_by(Scope.created_at.asc()).limit(limit)
-        res = await self.session.execute(stmt)
+        res = self.session.execute(stmt)
         return [self._scope_to_response(s) for s in res.scalars().all()]
 
-    # ================== OpenAPI Generation ==================
 
-    async def generate_openapi_spec(self, version_id: str) -> dict:
-        version = await self.get_version(version_id)
+    def generate_openapi_spec(self, version_id: str) -> dict:
+        version = self.get_version(version_id)
         if not version:
             raise ValueError("API version not found")
 
-        product = await self.get_product(version.product_id)
+        product = self.get_product(version.product_id)
         if not product:
             raise ValueError("API product not found")
 
-        endpoints = await self.list_endpoints(version_id, is_active=True)
-        scopes = await self.list_scopes(version.product_id)
+        endpoints = self.list_endpoints(version_id, is_active=True)
+        scopes = self.list_scopes(version.product_id)
 
         spec = {
             "openapi": "3.0.3",

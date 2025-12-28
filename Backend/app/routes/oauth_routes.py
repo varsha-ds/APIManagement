@@ -1,22 +1,8 @@
-"""
-OAuth2 Token endpoint (Client Credentials flow) - Postgres + SQLAlchemy.
-
-Assumptions:
-- Sync SQLAlchemy session via Depends(get_db)
-- KeyService + SubscriptionService are sync and accept db: Session
-- audit_log + rate_limit_check are sync (or have sync wrappers)
-- utils.security has:
-  - create_oauth_token(client_id: str, scopes: list[str], expires_in: int) -> str
-  - decode_token(token: str) -> dict | None
-  - OAUTH_TOKEN_EXPIRE_SECONDS: int
-- For secret verification, prefer verify_client_secret(secret, stored_hash) (bcrypt/argon2)
-"""
 
 from typing import Optional, List
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Depends, Request, Form
-from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -29,17 +15,11 @@ from app.utils.security import (
     create_oauth_token,
     OAUTH_TOKEN_EXPIRE_SECONDS,
     decode_token,
-    verify_client_secret,  # <-- recommended (see note below)
+    verify_client_secret, 
 )
+from app.schemas.oauth import OAuthTokenResponse
 
 router = APIRouter(prefix="/oauth", tags=["OAuth2"])
-
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    expires_in: int
-    scope: Optional[str] = None
 
 
 def get_key_service(db: Session = Depends(get_db)) -> KeyService:
@@ -50,7 +30,7 @@ def get_subscription_service(db: Session = Depends(get_db)) -> SubscriptionServi
     return SubscriptionService(db)
 
 
-@router.post("/token", response_model=TokenResponse)
+@router.post("/token", response_model=OAuthTokenResponse)
 def token_endpoint(
     request: Request,
     grant_type: str = Form(...),
@@ -60,13 +40,6 @@ def token_endpoint(
     key_service: KeyService = Depends(get_key_service),
     sub_service: SubscriptionService = Depends(get_subscription_service),
 ):
-    """
-    OAuth2 Token endpoint (Client Credentials flow).
-
-    - grant_type must be "client_credentials"
-    - client_id/client_secret validated against AppClient
-    - scope (optional) must be subset of granted scopes from approved subscriptions
-    """
 
     # Rate limit token requests per client_id
     rate_limit_check(f"oauth:token:{client_id}")
@@ -138,8 +111,7 @@ def token_endpoint(
             detail={"error": "invalid_client", "error_description": "Invalid client credentials"},
         )
 
-    # Get granted scopes for this client (from approved subscriptions)
-    # client.id is internal UUID PK
+
     granted_scopes: List[str] = sub_service.get_client_scopes(client.id)
 
     if not granted_scopes:
@@ -160,7 +132,7 @@ def token_endpoint(
             },
         )
 
-    # If specific scopes requested, validate subset of granted
+  
     token_scopes = granted_scopes
     if scope:
         requested_scopes = scope.split()
@@ -185,9 +157,8 @@ def token_endpoint(
             )
         token_scopes = requested_scopes
 
-    # Generate access token JWT
     access_token = create_oauth_token(
-        client_id=client_id,              # public client_id in 'sub'
+        client_id=client_id,             
         scopes=token_scopes,
         expires_in=OAUTH_TOKEN_EXPIRE_SECONDS,
     )
@@ -201,7 +172,7 @@ def token_endpoint(
         request=request,
     )
 
-    return TokenResponse(
+    return OAuthTokenResponse(
         access_token=access_token,
         token_type="bearer",
         expires_in=OAUTH_TOKEN_EXPIRE_SECONDS,
@@ -214,10 +185,7 @@ def introspect_token(
     request: Request,
     token: str = Form(...),
 ):
-    """
-    Token introspection endpoint (RFC 7662-ish).
-    Returns info about the provided token.
-    """
+
     payload = decode_token(token)
     if not payload:
         return {"active": False}
@@ -226,13 +194,12 @@ def introspect_token(
     exp = payload.get("exp")
     iat = payload.get("iat")
 
-    # Your decode_token might return exp/iat as datetime or int; handle both
+   
     def _to_int_ts(x):
         if x is None:
             return None
         if isinstance(x, int):
             return x
-        # datetime-like
         return int(x.timestamp())
 
     return {

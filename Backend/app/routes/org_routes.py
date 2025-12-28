@@ -1,12 +1,4 @@
-"""
-Organization management routes (Postgres + SQLAlchemy).
 
-Assumptions:
-- Sync SQLAlchemy session via Depends(get_db)
-- OrganizationService is sync and accepts db: Session
-- audit_log is sync (or has a sync wrapper)
-- AuthContext has role, org_id, identity_id
-"""
 
 from typing import Optional, List
 from uuid import UUID
@@ -36,7 +28,7 @@ def create_organization(
     auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN])),
     org_service: OrganizationService = Depends(get_org_service),
 ):
-    """Create a new organization (platform admin only)."""
+   
     try:
         org = org_service.create_organization(data)
 
@@ -61,12 +53,7 @@ def list_organizations(
     auth: AuthContext = Depends(get_current_user),
     org_service: OrganizationService = Depends(get_org_service),
 ):
-    """
-    List organizations.
-
-    - Platform admins see all organizations
-    - Other users only see their own organization
-    """
+    
     if auth.role == UserRole.PLATFORM_ADMIN:
         return org_service.list_organizations(is_active=is_active, limit=limit, offset=offset)
 
@@ -102,12 +89,7 @@ def update_organization(
     auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN])),
     org_service: OrganizationService = Depends(get_org_service),
 ):
-    """
-    Update organization.
-
-    - Platform admins can update any organization
-    - Org admins can only update their own organization (except is_active)
-    """
+   
     if auth.role == UserRole.ORG_ADMIN:
         if auth.org_id != org_id:
             raise HTTPException(status_code=403, detail="Access denied")

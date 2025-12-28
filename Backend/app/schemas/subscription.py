@@ -1,12 +1,3 @@
-"""
-Pydantic schemas for Subscriptions.
-
-Client-facing payloads use scope NAMES (List[str]) for simplicity.
-DB stores scopes as normalized many-to-many relationships.
-"""
-
-from __future__ import annotations
-
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List
 from datetime import datetime
@@ -23,6 +14,7 @@ class SubscriptionStatus(str, Enum):
 
 class SubscriptionCreate(BaseModel):
     api_version_id: UUID
+    app_client_id: UUID
     requested_scopes: List[str] = Field(..., min_length=1)
     justification: Optional[str] = None
 

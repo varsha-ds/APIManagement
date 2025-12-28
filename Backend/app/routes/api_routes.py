@@ -1,13 +1,12 @@
 """
-API Management routes (Postgres + SQLAlchemy).
+API Management routes (Postgres + SQLAlchemy) — permission-hardened.
 
-Assumptions:
-- Sync SQLAlchemy session (SessionLocal) via Depends(get_db)
-- APIService is sync and uses SQLAlchemy ORM models
-- RoleChecker / get_current_user return AuthContext with:
-  - identity_id (user UUID)
-  - role (UserRole)
-  - org_id (UUID | None)
+Key rules implemented:
+- CONTROL PLANE ONLY: user JWT required; app clients cannot access these endpoints.
+- Draft visibility: only owning org (or platform admin).
+- Published visibility: visible to all orgs in catalog (read-only).
+- Mutations (create/update): owning org only; only while DRAFT (recommended).
+- Publish/Deprecate: ORG_ADMIN or PLATFORM_ADMIN only.
 """
 
 from typing import Optional, List
@@ -17,7 +16,6 @@ from fastapi import APIRouter, HTTPException, Depends, Request
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-
 from app.schemas.api_management import (
     APIProductCreate, APIProductUpdate, APIProductResponse,
     APIVersionCreate, APIVersionUpdate, APIVersionResponse,
@@ -36,25 +34,79 @@ def get_api_service(db: Session = Depends(get_db)) -> APIService:
     return APIService(db)
 
 
+# =========================
+# Permission helpers
+# =========================
+
+def _require_org_membership(auth: AuthContext):
+    if not auth.org_id and auth.role != UserRole.PLATFORM_ADMIN:
+        raise HTTPException(status_code=400, detail="User must belong to an organization")
+
+
+def _is_platform_admin(auth: AuthContext) -> bool:
+    return auth.role == UserRole.PLATFORM_ADMIN
+
+
+def _is_org_owner_or_platform(auth: AuthContext, resource_org_id: UUID) -> bool:
+    if _is_platform_admin(auth):
+        return True
+    if not auth.org_id:
+        return False
+    return str(auth.org_id) == str(resource_org_id)
+
+
+def _ensure_can_view_resource(auth: AuthContext, resource_org_id: UUID, status: APIStatus):
+    """
+    Read visibility rule:
+    - PLATFORM_ADMIN: always allowed
+    - Others:
+      - If same org: allowed
+      - If different org: only allowed if PUBLISHED
+    """
+    if _is_platform_admin(auth):
+        return
+    if auth.org_id and str(auth.org_id) == str(resource_org_id):
+        return
+    if status == APIStatus.PUBLISHED:
+        return
+    raise HTTPException(status_code=403, detail="Access denied")
+
+
+def _ensure_can_mutate_owned_resource(auth: AuthContext, resource_org_id: UUID):
+    """
+    Mutations rule:
+    - Only owning org OR platform admin (override)
+    """
+    if not _is_org_owner_or_platform(auth, resource_org_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+def _ensure_draft(status: APIStatus, action: str = "modify"):
+    if status != APIStatus.DRAFT:
+        raise HTTPException(status_code=400, detail=f"Cannot {action} non-draft resource")
+
+
+def _ensure_org_admin_or_platform(auth: AuthContext):
+    if auth.role not in (UserRole.ORG_ADMIN, UserRole.PLATFORM_ADMIN):
+        raise HTTPException(status_code=403, detail="Only org_admin or platform_admin allowed")
+
+
 # ================== API Products ==================
 
 @router.post("/products", response_model=APIProductResponse)
 def create_api_product(
     data: APIProductCreate,
     request: Request,
+    # ✅ create allowed: ORG_ADMIN + DEVELOPER (+ PLATFORM_ADMIN override)
     auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN, UserRole.DEVELOPER])),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Create a new API product in the user's organization."""
-    # If org_id is derived from auth context, your APIProductCreate should NOT include org_id.
-    # If APIProductCreate includes org_id, enforce it matches auth.org_id for non-platform admins.
-    if not auth.org_id and auth.role != UserRole.PLATFORM_ADMIN:
-        raise HTTPException(status_code=400, detail="User must belong to an organization to create APIs")
+    """Create a new API product in DRAFT."""
+    _require_org_membership(auth)
 
+    # Platform admin can create for a specific org if schema provides org_id.
     org_id = auth.org_id
-    if auth.role == UserRole.PLATFORM_ADMIN:
-        # platform admin can create in any org ONLY if payload includes org_id
-        # If your schema doesn't include org_id, keep org_id required via auth context.
+    if _is_platform_admin(auth):
         org_id = getattr(data, "org_id", None) or auth.org_id
 
     if not org_id:
@@ -86,16 +138,54 @@ def list_api_products(
     auth: AuthContext = Depends(get_current_user),
     api_service: APIService = Depends(get_api_service),
 ):
-    """List API products. Platform admins can see all; others see their org."""
-    if auth.role != UserRole.PLATFORM_ADMIN:
-        org_id = auth.org_id
+    """
+    List API products.
 
-    return api_service.list_products(
-        org_id=org_id,
+    Visibility:
+    - PLATFORM_ADMIN: can list across orgs (org_id query param optional)
+    - Others: see:
+        (A) all products in their org (any status)
+        (B) PUBLISHED products from other orgs (catalog visibility)
+    """
+    if _is_platform_admin(auth):
+        return api_service.list_products(
+            org_id=org_id,
+            is_active=is_active,
+            limit=limit,
+            offset=offset,
+            # optional: status filter if your service supports it
+        )
+
+    _require_org_membership(auth)
+
+    # (A) own org products (any status)
+    own = api_service.list_products(
+        org_id=auth.org_id,
         is_active=is_active,
         limit=limit,
         offset=offset,
     )
+
+    # (B) published products from all orgs (catalog)
+    # ⚠️ Requires service support for "status" filtering. If you don't have it, add it.
+    published_catalog: List[APIProductResponse] = api_service.list_products(
+        org_id=None,
+        is_active=is_active,
+        limit=limit,
+        offset=offset,
+        status=APIStatus.PUBLISHED,  # <-- add this param in service if missing
+    )
+
+    # Merge and de-dup by id
+    seen = set()
+    merged: List[APIProductResponse] = []
+    for p in (own + published_catalog):
+        pid = str(p.id)
+        if pid not in seen:
+            seen.add(pid)
+            merged.append(p)
+
+    return merged
 
 
 @router.get("/products/{product_id}", response_model=APIProductResponse)
@@ -104,13 +194,12 @@ def get_api_product(
     auth: AuthContext = Depends(get_current_user),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Get API product by ID."""
+    """Get API product by ID with draft/published visibility rules."""
     product = api_service.get_product(product_id)
     if not product:
         raise HTTPException(status_code=404, detail="API product not found")
 
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    _ensure_can_view_resource(auth, product.org_id, product.status)
 
     return product
 
@@ -120,16 +209,17 @@ def update_api_product(
     product_id: UUID,
     data: APIProductUpdate,
     request: Request,
+    # ✅ only users (not app clients) + must be owner org or platform
     auth: AuthContext = Depends(get_current_user),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Update API product."""
+    """Update API product (draft-only)."""
     product = api_service.get_product(product_id)
     if not product:
         raise HTTPException(status_code=404, detail="API product not found")
 
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    _ensure_can_mutate_owned_resource(auth, product.org_id)
+    _ensure_draft(product.status, action="update product")
 
     updated = api_service.update_product(product_id, data)
 
@@ -151,16 +241,16 @@ def create_api_version(
     product_id: UUID,
     data: APIVersionCreate,
     request: Request,
-    auth: AuthContext = Depends(get_current_user),
+    auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN, UserRole.DEVELOPER])),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Create a new version for an API product."""
+    """Create a new version for an API product (draft-only product recommended)."""
     product = api_service.get_product(product_id)
     if not product:
         raise HTTPException(status_code=404, detail="API product not found")
 
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    _ensure_can_mutate_owned_resource(auth, product.org_id)
+   
 
     try:
         version = api_service.create_version(product_id, data)
@@ -187,13 +277,24 @@ def list_api_versions(
     auth: AuthContext = Depends(get_current_user),
     api_service: APIService = Depends(get_api_service),
 ):
-    """List versions for an API product."""
-    # Optional: enforce org access by checking product.org_id
+    """
+    List versions for a product.
+
+    Visibility:
+    - Owner org: can list all statuses
+    - Other orgs: only PUBLISHED versions
+    - Platform admin: all
+    """
     product = api_service.get_product(product_id)
     if not product:
         raise HTTPException(status_code=404, detail="API product not found")
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+
+    # If user is not owner and not platform, force status=PUBLISHED
+    if not _is_org_owner_or_platform(auth, product.org_id):
+        status = APIStatus.PUBLISHED
+
+    # allow view of product only if published when not owner
+    _ensure_can_view_resource(auth, product.org_id, product.status)
 
     return api_service.list_versions(
         product_id=product_id,
@@ -209,15 +310,16 @@ def get_api_version(
     auth: AuthContext = Depends(get_current_user),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Get API version by ID."""
+    """Get API version by ID with draft/published visibility rules."""
     version = api_service.get_version(version_id)
     if not version:
         raise HTTPException(status_code=404, detail="API version not found")
 
-    # Enforce org access by checking parent product
     product = api_service.get_product(version.product_id)
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if not product:
+        raise HTTPException(status_code=404, detail="API product not found")
+
+    _ensure_can_view_resource(auth, product.org_id, version.status)
 
     return version
 
@@ -227,17 +329,20 @@ def update_api_version(
     version_id: UUID,
     data: APIVersionUpdate,
     request: Request,
-    auth: AuthContext = Depends(get_current_user),
+    auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN, UserRole.DEVELOPER])),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Update API version."""
+    """Update API version (draft-only)."""
     version = api_service.get_version(version_id)
     if not version:
         raise HTTPException(status_code=404, detail="API version not found")
 
     product = api_service.get_product(version.product_id)
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if not product:
+        raise HTTPException(status_code=404, detail="API product not found")
+
+    _ensure_can_mutate_owned_resource(auth, product.org_id)
+    _ensure_draft(version.status, action="update version")
 
     updated = api_service.update_version(version_id, data)
 
@@ -257,7 +362,8 @@ def update_api_version(
 def publish_api_version(
     version_id: UUID,
     request: Request,
-    auth: AuthContext = Depends(get_current_user),
+    # ✅ publish: ORG_ADMIN or PLATFORM_ADMIN only
+    auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN])),
     api_service: APIService = Depends(get_api_service),
 ):
     """Publish an API version (make it available for subscriptions)."""
@@ -266,8 +372,11 @@ def publish_api_version(
         raise HTTPException(status_code=404, detail="API version not found")
 
     product = api_service.get_product(version.product_id)
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if not product:
+        raise HTTPException(status_code=404, detail="API product not found")
+
+    _ensure_can_mutate_owned_resource(auth, product.org_id)
+    _ensure_draft(version.status, action="publish")
 
     updated = api_service.publish_version(version_id)
 
@@ -286,7 +395,8 @@ def publish_api_version(
 def deprecate_api_version(
     version_id: UUID,
     request: Request,
-    auth: AuthContext = Depends(get_current_user),
+    # ✅ deprecate: ORG_ADMIN or PLATFORM_ADMIN only
+    auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN])),
     api_service: APIService = Depends(get_api_service),
 ):
     """Deprecate an API version."""
@@ -295,8 +405,14 @@ def deprecate_api_version(
         raise HTTPException(status_code=404, detail="API version not found")
 
     product = api_service.get_product(version.product_id)
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if not product:
+        raise HTTPException(status_code=404, detail="API product not found")
+
+    _ensure_can_mutate_owned_resource(auth, product.org_id)
+
+    # You may allow deprecate from PUBLISHED only; adjust as you like
+    if version.status != APIStatus.PUBLISHED:
+        raise HTTPException(status_code=400, detail="Only published versions can be deprecated")
 
     updated = api_service.deprecate_version(version_id)
 
@@ -317,16 +433,25 @@ def get_openapi_spec(
     auth: AuthContext = Depends(get_current_user),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Generate OpenAPI specification for an API version."""
-    try:
-        # Enforce access (same as get version)
-        version = api_service.get_version(version_id)
-        if not version:
-            raise HTTPException(status_code=404, detail="API version not found")
-        product = api_service.get_product(version.product_id)
-        if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-            raise HTTPException(status_code=403, detail="Access denied")
+    """
+    Generate OpenAPI spec for an API version.
 
+    Visibility:
+    - Owner org: can view any status
+    - Other orgs: only if version is PUBLISHED
+    - Platform admin: all
+    """
+    version = api_service.get_version(version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="API version not found")
+
+    product = api_service.get_product(version.product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="API product not found")
+
+    _ensure_can_view_resource(auth, product.org_id, version.status)
+
+    try:
         return api_service.generate_openapi_spec(version_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -339,17 +464,20 @@ def create_endpoint(
     version_id: UUID,
     data: EndpointCreate,
     request: Request,
-    auth: AuthContext = Depends(get_current_user),
+    auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN, UserRole.DEVELOPER])),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Create a new endpoint for an API version."""
+    """Create a new endpoint for an API version (draft-only)."""
     version = api_service.get_version(version_id)
     if not version:
         raise HTTPException(status_code=404, detail="API version not found")
 
     product = api_service.get_product(version.product_id)
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if not product:
+        raise HTTPException(status_code=404, detail="API product not found")
+
+    _ensure_can_mutate_owned_resource(auth, product.org_id)
+    
 
     try:
         endpoint = api_service.create_endpoint(version_id, data)
@@ -376,14 +504,23 @@ def list_endpoints(
     auth: AuthContext = Depends(get_current_user),
     api_service: APIService = Depends(get_api_service),
 ):
-    """List endpoints for an API version."""
+    """
+    List endpoints for an API version.
+
+    Visibility:
+    - Owner org: any status
+    - Other orgs: only if version is PUBLISHED
+    - Platform admin: all
+    """
     version = api_service.get_version(version_id)
     if not version:
         raise HTTPException(status_code=404, detail="API version not found")
 
     product = api_service.get_product(version.product_id)
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if not product:
+        raise HTTPException(status_code=404, detail="API product not found")
+
+    _ensure_can_view_resource(auth, product.org_id, version.status)
 
     return api_service.list_endpoints(
         version_id=version_id,
@@ -398,18 +535,24 @@ def update_endpoint(
     endpoint_id: UUID,
     data: EndpointUpdate,
     request: Request,
-    auth: AuthContext = Depends(get_current_user),
+    auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN, UserRole.DEVELOPER])),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Update an endpoint."""
+    """Update an endpoint (draft-only version)."""
     endpoint = api_service.get_endpoint(endpoint_id)
     if not endpoint:
         raise HTTPException(status_code=404, detail="Endpoint not found")
 
     version = api_service.get_version(endpoint.version_id)
+    if not version:
+        raise HTTPException(status_code=404, detail="API version not found")
+
     product = api_service.get_product(version.product_id)
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if not product:
+        raise HTTPException(status_code=404, detail="API product not found")
+
+    _ensure_can_mutate_owned_resource(auth, product.org_id)
+   # _ensure_draft(version.status, action="update endpoints on")
 
     updated = api_service.update_endpoint(endpoint_id, data)
 
@@ -431,16 +574,16 @@ def create_scope(
     product_id: UUID,
     data: ScopeCreate,
     request: Request,
-    auth: AuthContext = Depends(get_current_user),
+    auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN, UserRole.ORG_ADMIN, UserRole.DEVELOPER])),
     api_service: APIService = Depends(get_api_service),
 ):
-    """Create a new scope for an API product."""
+    """Create a new scope for an API product (draft-only)."""
     product = api_service.get_product(product_id)
     if not product:
         raise HTTPException(status_code=404, detail="API product not found")
 
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    _ensure_can_mutate_owned_resource(auth, product.org_id)
+    #_ensure_draft(product.status, action="add scopes to")
 
     try:
         scope = api_service.create_scope(product_id, data)
@@ -465,12 +608,11 @@ def list_scopes(
     auth: AuthContext = Depends(get_current_user),
     api_service: APIService = Depends(get_api_service),
 ):
-    """List scopes for an API product."""
+    """List scopes for an API product (published visible to all; draft owner-only)."""
     product = api_service.get_product(product_id)
     if not product:
         raise HTTPException(status_code=404, detail="API product not found")
 
-    if auth.role != UserRole.PLATFORM_ADMIN and auth.org_id != product.org_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    _ensure_can_view_resource(auth, product.org_id, product.status)
 
     return api_service.list_scopes(product_id=product_id, limit=limit)

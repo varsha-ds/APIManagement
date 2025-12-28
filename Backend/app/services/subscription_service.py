@@ -1,13 +1,10 @@
-"""
-Subscription and access request service (Postgres + SQLAlchemy).
-"""
 
 from datetime import datetime, timezone
 from typing import Optional, List
 from uuid import UUID
 
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+
 
 from app.models.subscription import (
     Subscription,
@@ -24,9 +21,6 @@ class SubscriptionService:
     def __init__(self, db: Session):
         self.db = db
 
-    # --------------------------------------------------
-    # Create subscription request
-    # --------------------------------------------------
 
     def create_subscription_request(
         self,
@@ -50,7 +44,6 @@ class SubscriptionService:
         if version.status != "published":
             raise ValueError("API version is not published")
 
-        # Prevent duplicate active subscription
         existing = (
             self.db.query(Subscription)
             .filter(
@@ -63,9 +56,7 @@ class SubscriptionService:
             .first()
         )
         if existing:
-            raise ValueError("Active subscription already exists")
-
-        # Validate requested scopes belong to product
+            raise ValueError("Subscription already exists")
         scopes = (
             self.db.query(Scope)
             .filter(
@@ -103,9 +94,7 @@ class SubscriptionService:
         self.db.refresh(sub)
         return sub
 
-    # --------------------------------------------------
-    # Read
-    # --------------------------------------------------
+
 
     def get_subscription(self, subscription_id: UUID) -> Optional[Subscription]:
         return self.db.get(Subscription, subscription_id)
@@ -135,9 +124,14 @@ class SubscriptionService:
 
         return q.offset(offset).limit(limit).all()
 
-    # --------------------------------------------------
-    # Approval / Denial / Revocation
-    # --------------------------------------------------
+    def get_subscription_org_id(self, subscription_id: UUID) -> Optional[UUID]:
+        row = (
+            self.db.query(AppClient.org_id)
+            .join(Subscription, Subscription.app_client_id == AppClient.id)
+            .filter(Subscription.id == subscription_id)
+            .first()
+        )
+        return row[0] if row else None
 
     def approve_subscription(
         self,
@@ -153,9 +147,7 @@ class SubscriptionService:
         if sub.status != SubscriptionStatus.PENDING:
             raise ValueError("Subscription is not pending")
 
-        requested = {
-            rs.scope.name for rs in sub.requested_scopes
-        }
+        requested = {s.name for s in sub.requested_scopes}
         invalid = set(granted_scope_names) - requested
         if invalid:
             raise ValueError(f"Cannot grant unrequested scopes: {invalid}")
@@ -234,9 +226,7 @@ class SubscriptionService:
         self.db.refresh(sub)
         return sub
 
-    # --------------------------------------------------
-    # OAuth helpers
-    # --------------------------------------------------
+
 
     def get_client_scopes(self, app_client_id: UUID) -> List[str]:
         """Return distinct granted scope names for approved subscriptions."""

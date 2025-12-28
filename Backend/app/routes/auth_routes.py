@@ -1,24 +1,16 @@
-"""
-Authentication routes (Postgres + SQLAlchemy).
-
-Assumptions:
-- Sync SQLAlchemy session via Depends(get_db)
-- AuthService is sync and accepts db: Session
-- rate_limit_check and audit_log are sync (or have sync wrappers)
-"""
 
 from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Depends, Request
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
-
 from app.database import get_db
+from app.models import User
 
 from app.schemas.auth import (
-    UserCreate, UserLogin, UserResponse, TokenResponse,
+    UserCreate, UserLogin, UserResponse, TokenResponse, LoginResponse,
     RefreshTokenRequest, UserRole,
+    UserUpdateRequest,
 )
 from app.services.auth_service import AuthService
 from app.middleware.auth_middleware import get_current_user, AuthContext, RoleChecker
@@ -32,32 +24,37 @@ def get_auth_service(db: Session = Depends(get_db)) -> AuthService:
     return AuthService(db)
 
 
-class LoginResponse(BaseModel):
-    user: UserResponse
-    tokens: TokenResponse
-
-
 @router.post("/register", response_model=UserResponse)
 def register(
     data: UserCreate,
     request: Request,
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    """
-    Register a new user.
-
-    - Self-registration only allowed for 'developer'
-    - Creating org_admin/platform_admin should be done via admin endpoint
-    """
+    
     try:
         # Rate limit registration attempts (by IP)
         ip = request.client.host if request.client else "unknown"
         rate_limit_check(f"auth:register:{ip}")
+       
+        db = auth_service.session  
+        admin_exists = (
+            db.query(User.id)
+            .filter(User.role == UserRole.PLATFORM_ADMIN)
+            .first()
+        )
+        if not admin_exists:
+            raise HTTPException(
+                status_code=403,
+                detail="Platform not initialized. Run /api/admin/setup to create the first platform admin.",
+            )
 
         if data.role != UserRole.DEVELOPER:
-            raise HTTPException(status_code=403, detail="Can only self-register as developer")
+            raise HTTPException(
+                status_code=403,
+                detail="Can only self-register as developer"
+            )
 
-        user = auth_service.register_user(data)
+        user = auth_service.register_user(data, org_id=str(data.org_id) if data.org_id else None)
 
         audit_log(
             action="user.register",
@@ -80,10 +77,7 @@ def login(
     request: Request,
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    """
-    Login with email and password.
-    Returns access + refresh tokens.
-    """
+    
     ip = request.client.host if request.client else "unknown"
 
     try:
@@ -103,7 +97,6 @@ def login(
         return {"user": user, "tokens": tokens}
 
     except ValueError as e:
-        # Log denied login attempt
         audit_log(
             action="auth.login",
             actor_id=data.email,
@@ -119,10 +112,9 @@ def login(
 @router.post("/refresh", response_model=TokenResponse)
 def refresh_token(
     data: RefreshTokenRequest,
-    request: Request,
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    """Refresh access token using refresh token."""
+    
     try:
         return auth_service.refresh_tokens(data.refresh_token)
     except ValueError as e:
@@ -134,7 +126,7 @@ def get_current_user_info(
     auth: AuthContext = Depends(get_current_user),
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    """Get current authenticated user info."""
+  
     if auth.identity_type != "user":
         raise HTTPException(status_code=400, detail="This endpoint is for user authentication only")
 
@@ -154,10 +146,7 @@ def list_users(
     auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN])),
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    """
-    List users (platform admin only).
-    Can filter by org and role.
-    """
+
     return auth_service.list_users(
         org_id=org_id,
         role=role,
@@ -173,12 +162,9 @@ def create_admin_user(
     auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN])),
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    """
-    Create a user with any role (platform admin only).
-    Use to create org_admin or other platform_admin users.
-    """
+
     try:
-        user = auth_service.register_user(data)
+        user = auth_service.register_user(data, org_id=str(data.org_id) if data.org_id else None)
 
         audit_log(
             action="user.create_admin",
@@ -195,13 +181,6 @@ def create_admin_user(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-class UserUpdateRequest(BaseModel):
-    name: Optional[str] = None
-    is_active: Optional[bool] = None
-    org_id: Optional[UUID] = None
-    role: Optional[UserRole] = None
-
-
 @router.patch("/users/{user_id}", response_model=UserResponse)
 def update_user(
     user_id: UUID,
@@ -210,7 +189,7 @@ def update_user(
     auth: AuthContext = Depends(RoleChecker([UserRole.PLATFORM_ADMIN])),
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    """Update user (platform admin only)."""
+
     user = auth_service.update_user(
         user_id=user_id,
         name=data.name,
