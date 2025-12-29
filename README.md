@@ -135,3 +135,12 @@ All operations are logged with:
 - Swagger UI: `/api/docs`
 - ReDoc: `/api/redoc`
 - OpenAPI Spec: `/api/openapi.json`
+
+## Diagrams & Screenshots
+
+![Control Plane vs Data Plane](documents/ControlPlane_DataPlane.png)
+![API Lifecycle & Subscription Flow](documents/APILifecycle_SubscriptionFlow.png)
+![Role & User Workflow](documents/Role_User_Workflow.png)
+![ERD](documents/ERD.png)
+![Localhost Screenshot 1](documents/localhost-1.png)
+![Localhost Screenshot 2](documents/localhost-2.png)
